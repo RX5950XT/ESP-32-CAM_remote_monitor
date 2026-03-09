@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Context7__resolve-library-id",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:openrouter.ai)",
+      "WebFetch(domain:randomnerdtutorials.com)",
+      "Bash(~/.platformio/penv/Scripts/pio.exe run)"
+    ]
+  }
+}

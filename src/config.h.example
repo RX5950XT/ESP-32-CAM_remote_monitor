@@ -1,0 +1,17 @@
+#pragma once
+
+// WiFi
+#define WIFI_SSID "your-ssid"
+#define WIFI_PASSWORD "your-password"
+
+// Telegram Bot
+#define BOT_TOKEN "123456:ABC-DEF..."
+#define CHAT_ID "your-chat-id"
+
+// OpenRouter
+#define OPENROUTER_API_KEY "sk-or-..."
+#define OPENROUTER_MODEL "google/gemini-2.5-flash-lite"
+
+// Default intervals (seconds)
+#define DEFAULT_MONITOR_INTERVAL_SEC 300
+#define DEFAULT_AI_INTERVAL_SEC 60
