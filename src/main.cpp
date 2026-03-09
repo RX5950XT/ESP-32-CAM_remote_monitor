@@ -100,20 +100,16 @@ void loop() {
         Serial.println("Scheduled AI detection...");
         camera_fb_t* fb = capturePhoto(FRAMESIZE_VGA);
         if (fb) {
-            bool personDetected = analyzePhotoForHuman(fb);
+            String aiResponse;
+            bool personDetected = analyzePhotoForHuman(fb, aiResponse);
             if (personDetected) {
                 Serial.println("ALERT: Person detected!");
-                // Capture a higher-res photo for the alert
-                esp_camera_fb_return(fb);
-                fb = capturePhoto(FRAMESIZE_SVGA);
-                if (fb) {
-                    sendPhotoTelegram(fb, "🚨 AI 偵測到有人！");
-                    esp_camera_fb_return(fb);
-                }
+                delay(1000);
+                sendPhotoTelegram(fb, "🚨 AI 偵測到有人！");
             } else {
                 Serial.println("AI: No person detected");
-                esp_camera_fb_return(fb);
             }
+            esp_camera_fb_return(fb);
         } else {
             sendMessageTelegram("❌ AI 偵測拍照失敗");
         }

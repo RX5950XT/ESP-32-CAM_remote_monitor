@@ -6,7 +6,8 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:openrouter.ai)",
       "WebFetch(domain:randomnerdtutorials.com)",
-      "Bash(~/.platformio/penv/Scripts/pio.exe run)"
+      "Bash(~/.platformio/penv/Scripts/pio.exe run)",
+      "Bash(~/.platformio/penv/Scripts/pio run)"
     ]
   }
 }

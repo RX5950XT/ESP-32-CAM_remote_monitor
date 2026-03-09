@@ -43,7 +43,8 @@ static char* base64Encode(const uint8_t* data, size_t inputLen, size_t* outputLe
     return output;
 }
 
-bool analyzePhotoForHuman(camera_fb_t* fb) {
+bool analyzePhotoForHuman(camera_fb_t* fb, String& aiResponse) {
+    aiResponse = "";
     if (!fb) return false;
 
     Serial.printf("AI analysis: encoding %u bytes...\n", fb->len);
@@ -129,24 +130,58 @@ bool analyzePhotoForHuman(camera_fb_t* fb) {
         }
     }
 
-    // Read response body
+    // Read response body - wait for complete JSON
     String responseBody = "";
-    while (client.available()) {
-        responseBody += client.readStringUntil('\n');
+    timeout = millis();
+    while (millis() - timeout < 15000) {
+        while (client.available()) {
+            responseBody += client.readStringUntil('\n');
+            timeout = millis();  // Reset timeout on data received
+        }
+        // Check if we have complete JSON
+        if (responseBody.indexOf('{') != -1 && responseBody.lastIndexOf('}') != -1) {
+            break;
+        }
+        delay(50);
     }
     client.stop();
 
     Serial.printf("AI response: %s\n", responseBody.c_str());
 
+    // Strip chunked transfer encoding: find first '{' for JSON start
+    int jsonStart = responseBody.indexOf('{');
+    int jsonEnd = responseBody.lastIndexOf('}');
+    if (jsonStart == -1 || jsonEnd == -1) {
+        aiResponse = "無JSON回應: " + responseBody.substring(0, 300);
+        return false;
+    }
+    String jsonBody = responseBody.substring(jsonStart, jsonEnd + 1);
+
+    // Save raw response for debugging
+    if (jsonBody.length() > 500) {
+        aiResponse = jsonBody.substring(0, 500) + "...";
+    } else {
+        aiResponse = jsonBody;
+    }
+
     // Parse JSON response
     JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, responseBody);
+    DeserializationError error = deserializeJson(doc, jsonBody);
     if (error) {
         Serial.printf("JSON parse failed: %s\n", error.c_str());
+        aiResponse = "JSON錯誤: " + String(error.c_str()) + "\n" + aiResponse;
+        return false;
+    }
+
+    // Check for API error
+    String apiError = doc["error"]["message"] | "";
+    if (apiError.length() > 0) {
+        aiResponse = "API錯誤: " + apiError;
         return false;
     }
 
     String content = doc["choices"][0]["message"]["content"] | "";
+    aiResponse = content;  // Override with clean AI answer if successful
     content.toLowerCase();
 
     Serial.printf("AI answer: %s\n", content.c_str());

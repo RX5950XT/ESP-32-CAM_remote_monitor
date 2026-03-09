@@ -21,7 +21,7 @@ bool cameraInit() {
     config.pin_sccb_scl = SIOC_GPIO_NUM;
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
-    config.xclk_freq_hz = 20000000;
+    config.xclk_freq_hz = 10000000;  // 降低時脈，允許更長曝光時間
     config.pixel_format = PIXFORMAT_JPEG;
     config.grab_mode = CAMERA_GRAB_LATEST;
 
@@ -43,6 +43,20 @@ bool cameraInit() {
         return false;
     }
 
+    // Adjust sensor settings for better low-light performance
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor) {
+        sensor->set_brightness(sensor, 1);      // 亮度 +1
+        sensor->set_contrast(sensor, 1);         // 對比度 +1
+        sensor->set_saturation(sensor, 0);       // 飽和度中性
+        sensor->set_aec2(sensor, 1);             // 開啟自動曝光 DSP
+        sensor->set_ae_level(sensor, 2);         // 自動曝光補償最大 +2
+        sensor->set_exposure_ctrl(sensor, 1);    // 開啟自動曝光（讓相機自己適應環境）
+        sensor->set_gain_ctrl(sensor, 1);        // 開啟自動增益
+        sensor->set_gainceiling(sensor, (gainceiling_t)6); // 增益上限 128x（自動模式給足空間）
+        Serial.println("Camera exposure settings adjusted for low-light");
+    }
+
     Serial.println("Camera initialized successfully");
     return true;
 }
@@ -57,14 +71,20 @@ camera_fb_t* capturePhoto(framesize_t frameSize) {
 
     sensor->set_framesize(sensor, frameSize);
 
-    // Discard first frame for auto white balance
-    camera_fb_t* fb = esp_camera_fb_get();
-    if (fb) {
-        esp_camera_fb_return(fb);
+    // Discard multiple frames to let auto exposure/gain stabilize
+    for (int i = 0; i < 3; i++) {
+        camera_fb_t* discard = esp_camera_fb_get();
+        if (discard) {
+            esp_camera_fb_return(discard);
+        }
+        delay(100);
     }
 
+    // Extra wait for auto exposure to fully adapt
+    delay(500);
+
     // Capture actual photo
-    fb = esp_camera_fb_get();
+    camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
         Serial.println("Camera capture failed");
         return nullptr;
