@@ -1,198 +1,253 @@
 #include "ai_monitor.h"
+#include "camera.h"
 #include "config.h"
-#include <WiFiClientSecure.h>
-#include <HTTPClient.h>
-#include <ArduinoJson.h>
-#include "mbedtls/base64.h"
+#include "model_settings.h"
+#include "person_detect_model_data.h"
 
-static const char* OPENROUTER_HOST = "openrouter.ai";
-static const int OPENROUTER_PORT = 443;
-static const char* OPENROUTER_PATH = "/api/v1/chat/completions";
+#include <TensorFlowLite_ESP32.h>
+#include "tensorflow/lite/micro/micro_error_reporter.h"
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
 
-static char* base64Encode(const uint8_t* data, size_t inputLen, size_t* outputLen) {
-    // Calculate required output buffer size
-    size_t requiredLen = 0;
-    mbedtls_base64_encode(nullptr, 0, &requiredLen, data, inputLen);
+#include <esp_heap_caps.h>
+#include <esp_timer.h>
 
-    // Allocate in PSRAM if available
-    char* output = nullptr;
-    if (psramFound()) {
-        output = (char*)ps_malloc(requiredLen + 1);
-    } else {
-        output = (char*)malloc(requiredLen + 1);
+#ifndef PERSON_SCORE_MARGIN
+#define PERSON_SCORE_MARGIN 0.20f
+#endif
+#ifndef PERSON_MIN_SCORE
+#define PERSON_MIN_SCORE 0.70f
+#endif
+
+namespace {
+tflite::ErrorReporter* error_reporter = nullptr;
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* input = nullptr;
+bool g_modelReady = false;
+
+// Official example uses ~81–100 KB; allocate in PSRAM when available.
+constexpr int kTensorArenaSize = 100 * 1024;
+uint8_t* tensor_arena = nullptr;
+
+// Scratch buffer for grayscale capture (uint8), converted to int8 for the model.
+uint8_t gray_scratch[kMaxImageSize];
+
+void grayStats(const uint8_t* buf, size_t n, int& meanOut, int& minOut, int& maxOut) {
+    if (n == 0) {
+        meanOut = minOut = maxOut = 0;
+        return;
+    }
+    uint32_t sum = 0;
+    uint8_t mn = 255;
+    uint8_t mx = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t v = buf[i];
+        sum += v;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    meanOut = (int)(sum / n);
+    minOut = (int)mn;
+    maxOut = (int)mx;
+}
+}  // namespace
+
+bool personDetectInit() {
+    if (g_modelReady) return true;
+
+    static tflite::MicroErrorReporter micro_error_reporter;
+    error_reporter = &micro_error_reporter;
+
+    model = tflite::GetModel(g_person_detect_model_data);
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        Serial.printf("Model schema version mismatch: %lu vs %d\n",
+                      (unsigned long)model->version(), TFLITE_SCHEMA_VERSION);
+        return false;
     }
 
-    if (!output) {
-        Serial.println("Failed to allocate base64 buffer");
-        return nullptr;
+    if (tensor_arena == nullptr) {
+        if (psramFound()) {
+            tensor_arena = (uint8_t*)heap_caps_malloc(
+                kTensorArenaSize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (tensor_arena == nullptr) {
+            tensor_arena = (uint8_t*)heap_caps_malloc(
+                kTensorArenaSize, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+    }
+    if (tensor_arena == nullptr) {
+        Serial.printf("Failed to allocate tensor arena (%d bytes)\n", kTensorArenaSize);
+        return false;
     }
 
-    size_t actualLen = 0;
-    int ret = mbedtls_base64_encode(
-        (unsigned char*)output, requiredLen + 1, &actualLen,
-        data, inputLen);
+    // Ops required by the official person_detection graph.
+    static tflite::MicroMutableOpResolver<5> micro_op_resolver;
+    micro_op_resolver.AddAveragePool2D();
+    micro_op_resolver.AddConv2D();
+    micro_op_resolver.AddDepthwiseConv2D();
+    micro_op_resolver.AddReshape();
+    micro_op_resolver.AddSoftmax();
 
-    if (ret != 0) {
-        Serial.printf("Base64 encode failed: %d\n", ret);
-        free(output);
-        return nullptr;
+    static tflite::MicroInterpreter static_interpreter(
+        model, micro_op_resolver, tensor_arena, kTensorArenaSize, error_reporter);
+    interpreter = &static_interpreter;
+
+    if (interpreter->AllocateTensors() != kTfLiteOk) {
+        Serial.println("AllocateTensors() failed");
+        return false;
     }
 
-    output[actualLen] = '\0';
-    *outputLen = actualLen;
-    return output;
+    input = interpreter->input(0);
+    if (input == nullptr) {
+        Serial.println("Model input tensor is null");
+        return false;
+    }
+    if (input->bytes != (size_t)kMaxImageSize) {
+        Serial.printf("Unexpected input bytes: %d (expected %d)\n",
+                      input->bytes, kMaxImageSize);
+        return false;
+    }
+    if (input->data.raw == nullptr) {
+        Serial.println("Model input data pointer is null");
+        return false;
+    }
+
+    g_modelReady = true;
+    Serial.printf("Local person_detection ready (model %d bytes, arena %d)\n",
+                  g_person_detect_model_data_len, kTensorArenaSize);
+    Serial.printf("Input type=%d dims=%d bytes=%d\n",
+                  (int)input->type, input->dims ? input->dims->size : -1, input->bytes);
+    Serial.printf("Detect thresholds: min_score=%.2f margin=%.2f cooldown=%ds\n",
+                  (double)PERSON_MIN_SCORE, (double)PERSON_SCORE_MARGIN,
+                  (int)ALERT_COOLDOWN_SEC);
+    return true;
 }
 
-bool analyzePhotoForHuman(camera_fb_t* fb, String& aiResponse) {
-    aiResponse = "";
-    if (!fb) return false;
-
-    Serial.printf("AI analysis: encoding %u bytes...\n", fb->len);
-
-    // Base64 encode the JPEG
-    size_t base64Len = 0;
-    char* base64Data = base64Encode(fb->buf, fb->len, &base64Len);
-    if (!base64Data) return false;
-
-    Serial.printf("Base64 encoded: %u bytes\n", base64Len);
-
-    // Build the data URI
-    String dataUri = "data:image/jpeg;base64,";
-    // We'll stream the JSON manually to avoid massive String concatenation
-
-    // Build JSON payload
-    // Using streaming approach to minimize memory usage
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    if (!client.connect(OPENROUTER_HOST, OPENROUTER_PORT)) {
-        Serial.println("Failed to connect to OpenRouter");
-        free(base64Data);
+bool detectPersonLocal(String& debugInfo) {
+    debugInfo = "";
+    if (!g_modelReady) {
+        debugInfo = "模型未初始化";
+        Serial.println(debugInfo);
+        return false;
+    }
+    if (input == nullptr || interpreter == nullptr) {
+        debugInfo = "interpreter 無效";
         return false;
     }
 
-    // Construct the JSON body parts
-    String jsonPrefix = "{\"model\":\"" + String(OPENROUTER_MODEL) + "\","
-        "\"messages\":[{\"role\":\"user\",\"content\":["
-        "{\"type\":\"text\",\"text\":\"這張照片中有沒有人？只回答『有』或『沒有』，不要有其他文字。\"},"
-        "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
-    String jsonSuffix = "\"}}]}],\"max_tokens\":10}";
-
-    size_t contentLength = jsonPrefix.length() + base64Len + jsonSuffix.length();
-
-    // Send HTTP request headers
-    client.println("POST " + String(OPENROUTER_PATH) + " HTTP/1.1");
-    client.println("Host: " + String(OPENROUTER_HOST));
-    client.println("Authorization: Bearer " + String(OPENROUTER_API_KEY));
-    client.println("Content-Type: application/json");
-    client.println("Content-Length: " + String(contentLength));
-    client.println("Connection: close");
-    client.println();
-
-    // Send body in chunks to avoid huge String allocation
-    client.print(jsonPrefix);
-
-    // Send base64 data in chunks
-    const size_t CHUNK_SIZE = 1024;
-    size_t sent = 0;
-    while (sent < base64Len) {
-        size_t toSend = min(CHUNK_SIZE, base64Len - sent);
-        client.write((const uint8_t*)(base64Data + sent), toSend);
-        sent += toSend;
-    }
-
-    client.print(jsonSuffix);
-
-    // Free base64 buffer immediately
-    free(base64Data);
-    base64Data = nullptr;
-
-    Serial.println("AI request sent, waiting for response...");
-
-    // Read response
-    unsigned long timeout = millis();
-    while (!client.available()) {
-        if (millis() - timeout > 30000) {
-            Serial.println("AI response timeout");
-            client.stop();
-            return false;
-        }
-        delay(100);
-    }
-
-    // Skip HTTP headers
-    bool headersEnded = false;
-    String responseLine;
-    while (client.available() && !headersEnded) {
-        responseLine = client.readStringUntil('\n');
-        if (responseLine == "\r") {
-            headersEnded = true;
-        }
-    }
-
-    // Read response body - wait for complete JSON
-    String responseBody = "";
-    timeout = millis();
-    while (millis() - timeout < 15000) {
-        while (client.available()) {
-            responseBody += client.readStringUntil('\n');
-            timeout = millis();  // Reset timeout on data received
-        }
-        // Check if we have complete JSON
-        if (responseBody.indexOf('{') != -1 && responseBody.lastIndexOf('}') != -1) {
-            break;
-        }
-        delay(50);
-    }
-    client.stop();
-
-    Serial.printf("AI response: %s\n", responseBody.c_str());
-
-    // Strip chunked transfer encoding: find first '{' for JSON start
-    int jsonStart = responseBody.indexOf('{');
-    int jsonEnd = responseBody.lastIndexOf('}');
-    if (jsonStart == -1 || jsonEnd == -1) {
-        aiResponse = "無JSON回應: " + responseBody.substring(0, 300);
+    if (!captureGray96(gray_scratch, sizeof(gray_scratch))) {
+        debugInfo = "灰階取像失敗";
+        Serial.println(debugInfo);
         return false;
     }
-    String jsonBody = responseBody.substring(jsonStart, jsonEnd + 1);
 
-    // Save raw response for debugging
-    if (jsonBody.length() > 500) {
-        aiResponse = jsonBody.substring(0, 500) + "...";
+    int grayMean = 0, grayMin = 0, grayMax = 0;
+    grayStats(gray_scratch, (size_t)kMaxImageSize, grayMean, grayMin, grayMax);
+    Serial.printf("Gray stats: mean=%d min=%d max=%d\n", grayMean, grayMin, grayMax);
+
+    // Quantize unsigned grayscale [0,255] → signed int8 for the model.
+    if (input->data.raw == nullptr || input->bytes < (size_t)kMaxImageSize) {
+        debugInfo = "input tensor buffer 無效";
+        Serial.println(debugInfo);
+        return false;
+    }
+    if (input->type == kTfLiteInt8) {
+        for (int i = 0; i < kMaxImageSize; i++) {
+            input->data.int8[i] = (int8_t)(gray_scratch[i] ^ 0x80);
+        }
+    } else if (input->type == kTfLiteUInt8) {
+        memcpy(input->data.uint8, gray_scratch, kMaxImageSize);
     } else {
-        aiResponse = jsonBody;
-    }
-
-    // Parse JSON response
-    JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, jsonBody);
-    if (error) {
-        Serial.printf("JSON parse failed: %s\n", error.c_str());
-        aiResponse = "JSON錯誤: " + String(error.c_str()) + "\n" + aiResponse;
+        debugInfo = "不支援的 input type";
+        Serial.printf("%s: %d\n", debugInfo.c_str(), (int)input->type);
         return false;
     }
 
-    // Check for API error
-    String apiError = doc["error"]["message"] | "";
-    if (apiError.length() > 0) {
-        aiResponse = "API錯誤: " + apiError;
+    int64_t t0 = esp_timer_get_time();
+    if (interpreter->Invoke() != kTfLiteOk) {
+        debugInfo = "推論 Invoke 失敗";
+        Serial.println(debugInfo);
+        return false;
+    }
+    int64_t elapsedMs = (esp_timer_get_time() - t0) / 1000;
+
+    TfLiteTensor* output = interpreter->output(0);
+    if (output == nullptr) {
+        debugInfo = "output tensor 無效";
         return false;
     }
 
-    String content = doc["choices"][0]["message"]["content"] | "";
-    aiResponse = content;  // Override with clean AI answer if successful
-    content.toLowerCase();
+    float person_score_f = 0.0f;
+    float no_person_score_f = 0.0f;
+    int8_t person_raw = 0;
+    int8_t no_person_raw = 0;
+    float out_scale = 0.0f;
+    int out_zp = 0;
 
-    Serial.printf("AI answer: %s\n", content.c_str());
+    if (output->type == kTfLiteInt8 || output->type == kTfLiteUInt8) {
+        // Match official examples: read via uint8 then store as int8.
+        person_raw = (int8_t)output->data.uint8[kPersonIndex];
+        no_person_raw = (int8_t)output->data.uint8[kNotAPersonIndex];
+        out_scale = output->params.scale;
+        out_zp = output->params.zero_point;
+        if (out_scale != 0.0f) {
+            person_score_f = (person_raw - out_zp) * out_scale;
+            no_person_score_f = (no_person_raw - out_zp) * out_scale;
+        } else {
+            // Fallback: map signed int8 to approx 0..1
+            person_score_f = ((int)person_raw + 128) / 255.0f;
+            no_person_score_f = ((int)no_person_raw + 128) / 255.0f;
+        }
+    } else if (output->type == kTfLiteFloat32) {
+        person_score_f = output->data.f[kPersonIndex];
+        no_person_score_f = output->data.f[kNotAPersonIndex];
+    } else {
+        debugInfo = "不支援的 output type";
+        Serial.printf("%s: %d\n", debugInfo.c_str(), (int)output->type);
+        return false;
+    }
 
-    // Check if the model detected a person
-    bool personDetected = content.indexOf("有") != -1 && content.indexOf("沒有") == -1;
+    const bool beatMargin =
+        (person_score_f > (no_person_score_f + PERSON_SCORE_MARGIN));
+    const bool aboveMin = (person_score_f >= PERSON_MIN_SCORE);
+    const bool personDetected = beatMargin && aboveMin;
 
-    // Also check for alternative positive responses
+    const char* reason = "PERSON";
     if (!personDetected) {
-        personDetected = content.indexOf("yes") != -1;
+        if (!beatMargin && !aboveMin) {
+            reason = "no person (margin+min)";
+        } else if (!beatMargin) {
+            reason = "no person (margin)";
+        } else {
+            reason = "no person (min_score)";
+        }
+    }
+
+    char buf[220];
+    snprintf(buf, sizeof(buf),
+             "person=%.3f no_person=%.3f raw=%d/%d zp=%d scale=%.5f "
+             "min=%.2f margin=%.2f gray_mean=%d time=%lldms -> %s",
+             person_score_f, no_person_score_f, (int)person_raw, (int)no_person_raw,
+             out_zp, (double)out_scale, (double)PERSON_MIN_SCORE,
+             (double)PERSON_SCORE_MARGIN, grayMean, (long long)elapsedMs, reason);
+    debugInfo = buf;
+    Serial.println(debugInfo);
+
+    // Compact caption for Telegram when alerting.
+    if (personDetected) {
+        char cap[96];
+        snprintf(cap, sizeof(cap),
+                 "🚨 本地偵測到有人\nperson=%.2f no_person=%.2f",
+                 person_score_f, no_person_score_f);
+        debugInfo = cap;
     }
 
     return personDetected;
+}
+
+bool analyzePhotoForHuman(camera_fb_t* /*fb*/, String& aiResponse) {
+    // Local model captures its own 96x96 grayscale frame; ignore JPEG fb.
+    return detectPersonLocal(aiResponse);
 }

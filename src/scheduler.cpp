@@ -1,27 +1,40 @@
 #include "scheduler.h"
 
-bool shouldRunMonitor(SchedulerState& state) {
-    if (!state.monitorEnabled) return false;
-
-    unsigned long now = millis();
-    unsigned long intervalMs = (unsigned long)state.monitorIntervalSec * 1000UL;
-
-    if (now - state.lastMonitorTime >= intervalMs) {
-        state.lastMonitorTime = now;
-        return true;
-    }
-    return false;
+static unsigned long intervalMsFromSec(int sec) {
+    if (sec < 0) sec = 0;
+    // Cap to avoid 32-bit overflow on sec * 1000 (ESP32 unsigned long is 32-bit).
+    const unsigned long maxSec = 4294967UL;  // floor((2^32-1)/1000)
+    unsigned long s = (unsigned long)sec;
+    if (s > maxSec) s = maxSec;
+    return s * 1000UL;
 }
 
-bool shouldRunAI(SchedulerState& state) {
-    if (!state.aiEnabled) return false;
-
+bool shouldRunMonitor(const SchedulerState& state) {
+    if (!state.monitorEnabled || state.monitorRunning) return false;
     unsigned long now = millis();
-    unsigned long intervalMs = (unsigned long)state.aiIntervalSec * 1000UL;
+    return (now - state.lastMonitorTime) >= intervalMsFromSec(state.monitorIntervalSec);
+}
 
-    if (now - state.lastAITime >= intervalMs) {
-        state.lastAITime = now;
-        return true;
-    }
-    return false;
+bool shouldRunAI(const SchedulerState& state) {
+    if (!state.aiEnabled || state.aiRunning) return false;
+    unsigned long now = millis();
+    return (now - state.lastAITime) >= intervalMsFromSec(state.aiIntervalSec);
+}
+
+void markMonitorRunning(SchedulerState& state) {
+    state.monitorRunning = true;
+}
+
+void markAIRunning(SchedulerState& state) {
+    state.aiRunning = true;
+}
+
+void markMonitorDone(SchedulerState& state) {
+    state.lastMonitorTime = millis();
+    state.monitorRunning = false;
+}
+
+void markAIDone(SchedulerState& state) {
+    state.lastAITime = millis();
+    state.aiRunning = false;
 }

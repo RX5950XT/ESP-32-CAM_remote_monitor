@@ -8,10 +8,27 @@
 #define BOT_TOKEN "123456:ABC-DEF..."
 #define CHAT_ID "your-chat-id"
 
-// OpenRouter
-#define OPENROUTER_API_KEY "sk-or-..."
-#define OPENROUTER_MODEL "google/gemma-3-27b-it"
+// Local person detection (TFLite Micro person_detection)
+// Both conditions must pass to trigger alert (reduces empty-room false positives).
+#ifndef PERSON_SCORE_MARGIN
+#define PERSON_SCORE_MARGIN 0.20f  // person must beat no_person by this much
+#endif
+#ifndef PERSON_MIN_SCORE
+#define PERSON_MIN_SCORE 0.70f    // absolute confidence after dequant (~0..1)
+#endif
+
+// After a person alert photo is sent, suppress further alerts for this many seconds.
+// 0 = disabled. Tuned in firmware (config.h), not via Telegram command.
+#ifndef ALERT_COOLDOWN_SEC
+#define ALERT_COOLDOWN_SEC 0
+#endif
 
 // Default intervals (seconds)
-#define DEFAULT_MONITOR_INTERVAL_SEC 300
-#define DEFAULT_AI_INTERVAL_SEC 60
+#define DEFAULT_MONITOR_INTERVAL_SEC 10
+#define DEFAULT_AI_INTERVAL_SEC 10
+
+// Allowed intervals (seconds).
+#define MIN_MONITOR_INTERVAL_SEC 3
+#define MIN_AI_INTERVAL_SEC 3
+#define MAX_MONITOR_INTERVAL_SEC 86400
+#define MAX_AI_INTERVAL_SEC 86400

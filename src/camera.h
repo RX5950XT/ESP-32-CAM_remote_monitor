@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_camera.h"
+#include <stdint.h>
 
 // AI Thinker ESP32-CAM pin definitions
 #define PWDN_GPIO_NUM  32
@@ -20,5 +21,14 @@
 #define HREF_GPIO_NUM  23
 #define PCLK_GPIO_NUM  22
 
+// Default: JPEG mode for Telegram photos.
 bool cameraInit();
+
+// Capture JPEG at the requested frame size (camera must be in JPEG mode).
 camera_fb_t* capturePhoto(framesize_t frameSize);
+
+// Capture one 96x96 grayscale frame into outBuf (must be kMaxImageSize bytes).
+// Switches to grayscale only if needed; leaves gray mode until JPEG capture needs it
+// (lazy restore) to avoid per-frame deinit/init thrashing.
+// Returns true on success.
+bool captureGray96(uint8_t* outBuf, size_t outBufLen);

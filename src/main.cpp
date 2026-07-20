@@ -9,12 +9,16 @@
 
 static WiFiClientSecure secureClient;
 static SchedulerState schedulerState;
+static unsigned long lastAlertMs = 0;
+static bool lastAlertValid = false;
 
 static void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
 
     Serial.printf("Connecting to WiFi: %s", WIFI_SSID);
     WiFi.mode(WIFI_STA);
+    WiFi.disconnect(true);
+    delay(100);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
     int attempts = 0;
@@ -31,15 +35,37 @@ static void connectWiFi() {
     }
 }
 
+static bool alertCooldownActive() {
+#if ALERT_COOLDOWN_SEC <= 0
+    return false;
+#else
+    if (!lastAlertValid) return false;
+    unsigned long elapsed = millis() - lastAlertMs;
+    return elapsed < ((unsigned long)ALERT_COOLDOWN_SEC * 1000UL);
+#endif
+}
+
+static void markAlertSent() {
+#if ALERT_COOLDOWN_SEC > 0
+    lastAlertMs = millis();
+    lastAlertValid = true;
+#endif
+}
+
 void setup() {
     Serial.begin(115200);
     Serial.println("\n\n=== ESP32-CAM Remote Monitor ===");
 
-    // Initialize camera
+    // Initialize camera (JPEG mode)
     if (!cameraInit()) {
         Serial.println("FATAL: Camera init failed, restarting...");
         delay(3000);
         ESP.restart();
+    }
+
+    // Initialize local TFLite person detection
+    if (!personDetectInit()) {
+        Serial.println("WARNING: Local person detection init failed");
     }
 
     // Connect to WiFi
@@ -64,7 +90,10 @@ void setup() {
     // Initialize Telegram bot
     telegramInit(secureClient);
 
-    sendMessageTelegram("🟢 ESP32-CAM 監控系統已啟動！\n輸入 /start 查看可用指令。");
+    sendMessageTelegram(
+        "🟢 ESP32-CAM 監控系統已啟動！\n"
+        "人物偵測：本地 TFLite person_detection\n"
+        "輸入 /start 查看可用指令。");
 
     Serial.println("Setup complete!");
 }
@@ -83,8 +112,41 @@ void loop() {
     // Handle Telegram commands
     handleTelegramMessages(schedulerState);
 
+    // Only one heavy camera/network job per loop (AI preferred when both due).
+    bool heavyJobRan = false;
+
+    // Local person detection: gray inference, then JPEG alert if person found
+    if (shouldRunAI(schedulerState)) {
+        markAIRunning(schedulerState);
+        heavyJobRan = true;
+        Serial.println("Scheduled local person detection...");
+        String debugInfo;
+        bool personDetected = detectPersonLocal(debugInfo);
+        if (personDetected) {
+            if (alertCooldownActive()) {
+                Serial.printf("Person detected but alert cooldown active (%ds)\n",
+                              (int)ALERT_COOLDOWN_SEC);
+            } else {
+                Serial.println("ALERT: Person detected!");
+                camera_fb_t* fb = capturePhoto(FRAMESIZE_VGA);
+                if (fb) {
+                    sendPhotoTelegram(fb, debugInfo.c_str());
+                    esp_camera_fb_return(fb);
+                    markAlertSent();
+                } else {
+                    sendMessageTelegram("🚨 偵測到有人，但警報拍照失敗\n" + debugInfo);
+                    markAlertSent();  // still cool down to avoid spam on capture fail
+                }
+            }
+        } else {
+            Serial.println("Local AI: No person detected");
+        }
+        markAIDone(schedulerState);
+    }
+
     // Periodic monitoring: capture and send photo
-    if (shouldRunMonitor(schedulerState)) {
+    if (!heavyJobRan && shouldRunMonitor(schedulerState)) {
+        markMonitorRunning(schedulerState);
         Serial.println("Scheduled monitor capture...");
         camera_fb_t* fb = capturePhoto(FRAMESIZE_SVGA);
         if (fb) {
@@ -93,26 +155,7 @@ void loop() {
         } else {
             sendMessageTelegram("❌ 定期拍照失敗");
         }
-    }
-
-    // AI detection: capture, analyze, alert if person detected
-    if (shouldRunAI(schedulerState)) {
-        Serial.println("Scheduled AI detection...");
-        camera_fb_t* fb = capturePhoto(FRAMESIZE_VGA);
-        if (fb) {
-            String aiResponse;
-            bool personDetected = analyzePhotoForHuman(fb, aiResponse);
-            if (personDetected) {
-                Serial.println("ALERT: Person detected!");
-                delay(1000);
-                sendPhotoTelegram(fb, "🚨 AI 偵測到有人！");
-            } else {
-                Serial.println("AI: No person detected");
-            }
-            esp_camera_fb_return(fb);
-        } else {
-            sendMessageTelegram("❌ AI 偵測拍照失敗");
-        }
+        markMonitorDone(schedulerState);
     }
 
     delay(10);

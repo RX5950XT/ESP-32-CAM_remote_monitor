@@ -98,6 +98,20 @@ void sendMessageTelegram(const String& message) {
     bot->sendMessage(CHAT_ID, message, "");
 }
 
+static bool parseIntervalArg(const String& text, int& outVal) {
+    int sp = text.indexOf(' ');
+    if (sp < 0) return false;
+    String param = text.substring(sp + 1);
+    param.trim();
+    if (param.length() == 0) return false;
+    // Reject non-numeric tails like "10abc"
+    for (unsigned i = 0; i < param.length(); i++) {
+        if (!isDigit(param[i])) return false;
+    }
+    outVal = param.toInt();
+    return true;
+}
+
 static String buildStatusMessage(const SchedulerState& state) {
     String msg = "=== 系統狀態 ===\n\n";
 
@@ -105,9 +119,15 @@ static String buildStatusMessage(const SchedulerState& state) {
     msg += state.monitorEnabled ? "開啟" : "關閉";
     msg += "\n   間隔: " + String(state.monitorIntervalSec) + " 秒\n\n";
 
-    msg += "🤖 AI 人物偵測: ";
+    msg += "🤖 本地人物偵測: ";
     msg += state.aiEnabled ? "開啟" : "關閉";
-    msg += "\n   間隔: " + String(state.aiIntervalSec) + " 秒\n\n";
+    msg += "\n   間隔: " + String(state.aiIntervalSec) + " 秒\n";
+    msg += "   警報冷卻: ";
+#if ALERT_COOLDOWN_SEC <= 0
+    msg += "關閉\n\n";
+#else
+    msg += String(ALERT_COOLDOWN_SEC) + " 秒（config.h）\n\n";
+#endif
 
     msg += "📶 WiFi RSSI: " + String(WiFi.RSSI()) + " dBm\n";
     msg += "💾 Free heap: " + String(ESP.getFreeHeap() / 1024) + " KB\n";
@@ -124,11 +144,15 @@ static String buildHelpMessage() {
     msg += "🔄 定期監控:\n";
     msg += "  /monitor_on - 開啟定期拍照\n";
     msg += "  /monitor_off - 關閉定期拍照\n";
-    msg += "  /monitor_interval <秒> - 設定間隔\n\n";
-    msg += "🤖 AI 人物偵測:\n";
-    msg += "  /ai_on - 開啟 AI 偵測\n";
-    msg += "  /ai_off - 關閉 AI 偵測\n";
-    msg += "  /ai_interval <秒> - 設定間隔\n\n";
+    msg += "  /monitor_interval <秒> - 設定間隔（" +
+          String(MIN_MONITOR_INTERVAL_SEC) + "～" +
+          String(MAX_MONITOR_INTERVAL_SEC) + "）\n\n";
+    msg += "🤖 本地人物偵測 (TFLite):\n";
+    msg += "  /ai_on - 開啟本地偵測\n";
+    msg += "  /ai_off - 關閉本地偵測\n";
+    msg += "  /ai_interval <秒> - 設定間隔（" +
+          String(MIN_AI_INTERVAL_SEC) + "～" +
+          String(MAX_AI_INTERVAL_SEC) + "）\n\n";
     msg += "ℹ️ 其他:\n";
     msg += "  /status - 查看系統狀態\n";
     msg += "  /start - 顯示此說明\n";
@@ -172,41 +196,51 @@ void handleTelegramMessages(SchedulerState& state) {
         else if (text == "/monitor_on") {
             state.monitorEnabled = true;
             state.lastMonitorTime = millis();
+            state.monitorRunning = false;
             sendMessageTelegram("✅ 定期監控已開啟，間隔 " + String(state.monitorIntervalSec) + " 秒");
         }
         else if (text == "/monitor_off") {
             state.monitorEnabled = false;
+            state.monitorRunning = false;
             sendMessageTelegram("⛔ 定期監控已關閉");
         }
         else if (text.startsWith("/monitor_interval")) {
-            String param = text.substring(18);
-            param.trim();
-            int val = param.toInt();
-            if (val >= 10) {
+            int val = 0;
+            if (parseIntervalArg(text, val) &&
+                val >= MIN_MONITOR_INTERVAL_SEC &&
+                val <= MAX_MONITOR_INTERVAL_SEC) {
                 state.monitorIntervalSec = val;
                 sendMessageTelegram("✅ 監控間隔已設定為 " + String(val) + " 秒");
             } else {
-                sendMessageTelegram("❌ 間隔至少 10 秒");
+                sendMessageTelegram(
+                    "❌ 監控間隔請設 " + String(MIN_MONITOR_INTERVAL_SEC) +
+                    "～" + String(MAX_MONITOR_INTERVAL_SEC) + " 秒\n"
+                    "例：/monitor_interval 30");
             }
         }
         else if (text == "/ai_on") {
             state.aiEnabled = true;
             state.lastAITime = millis();
-            sendMessageTelegram("✅ AI 人物偵測已開啟，間隔 " + String(state.aiIntervalSec) + " 秒");
+            state.aiRunning = false;
+            sendMessageTelegram("✅ 本地人物偵測已開啟，間隔 " + String(state.aiIntervalSec) + " 秒");
         }
         else if (text == "/ai_off") {
             state.aiEnabled = false;
-            sendMessageTelegram("⛔ AI 人物偵測已關閉");
+            state.aiRunning = false;
+            sendMessageTelegram("⛔ 本地人物偵測已關閉");
         }
         else if (text.startsWith("/ai_interval")) {
-            String param = text.substring(13);
-            param.trim();
-            int val = param.toInt();
-            if (val >= 10) {
+            int val = 0;
+            if (parseIntervalArg(text, val) &&
+                val >= MIN_AI_INTERVAL_SEC &&
+                val <= MAX_AI_INTERVAL_SEC) {
                 state.aiIntervalSec = val;
-                sendMessageTelegram("✅ AI 偵測間隔已設定為 " + String(val) + " 秒");
+                sendMessageTelegram("✅ 本地偵測間隔已設定為 " + String(val) + " 秒");
             } else {
-                sendMessageTelegram("❌ 間隔至少 10 秒");
+                sendMessageTelegram(
+                    "❌ 本地偵測間隔請設 " + String(MIN_AI_INTERVAL_SEC) +
+                    "～" + String(MAX_AI_INTERVAL_SEC) + " 秒\n"
+                    "例：/ai_interval 10");
             }
         }
         else if (text == "/status") {
