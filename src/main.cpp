@@ -6,11 +6,12 @@
 #include "telegram.h"
 #include "scheduler.h"
 #include "ai_monitor.h"
+#include "mcp_server.h"
+#include "device_control.h"
+#include "device_identity.h"
 
 static WiFiClientSecure secureClient;
 static SchedulerState schedulerState;
-static unsigned long lastAlertMs = 0;
-static bool lastAlertValid = false;
 
 static void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
@@ -35,23 +36,6 @@ static void connectWiFi() {
     }
 }
 
-static bool alertCooldownActive() {
-#if ALERT_COOLDOWN_SEC <= 0
-    return false;
-#else
-    if (!lastAlertValid) return false;
-    unsigned long elapsed = millis() - lastAlertMs;
-    return elapsed < ((unsigned long)ALERT_COOLDOWN_SEC * 1000UL);
-#endif
-}
-
-static void markAlertSent() {
-#if ALERT_COOLDOWN_SEC > 0
-    lastAlertMs = millis();
-    lastAlertValid = true;
-#endif
-}
-
 void setup() {
     Serial.begin(115200);
     Serial.println("\n\n=== ESP32-CAM Remote Monitor ===");
@@ -63,6 +47,10 @@ void setup() {
         ESP.restart();
     }
 
+    if (!deviceControlInit(schedulerState)) {
+        Serial.println("WARNING: Saved settings unavailable; inspect /status");
+    }
+
     // Initialize local TFLite person detection
     if (!personDetectInit()) {
         Serial.println("WARNING: Local person detection init failed");
@@ -70,6 +58,9 @@ void setup() {
 
     // Connect to WiFi
     connectWiFi();
+    mcpInit();
+    Serial.println(deviceTag());
+    Serial.println(deviceConnectionMessage());
 
     // Set time via NTP (needed for HTTPS certificate validation)
     configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
@@ -91,8 +82,7 @@ void setup() {
     telegramInit(secureClient);
 
     sendMessageTelegram(
-        "🟢 ESP32-CAM 監控系統已啟動！\n"
-        "人物偵測：本地 TFLite person_detection\n"
+        String("🟢 ESP32-CAM 監控系統已啟動！\n") + deviceConnectionMessage() + "\n"
         "輸入 /start 查看可用指令。");
 
     Serial.println("Setup complete!");
@@ -109,8 +99,10 @@ void loop() {
         }
     }
 
+    if (handleMcpClient(schedulerState)) return;
+
     // Handle Telegram commands
-    handleTelegramMessages(schedulerState);
+    if (handleTelegramMessages(schedulerState)) return;
 
     // Only one heavy camera/network job per loop (AI preferred when both due).
     bool heavyJobRan = false;
@@ -120,27 +112,7 @@ void loop() {
         markAIRunning(schedulerState);
         heavyJobRan = true;
         Serial.println("Scheduled local person detection...");
-        String debugInfo;
-        bool personDetected = detectPersonLocal(debugInfo);
-        if (personDetected) {
-            if (alertCooldownActive()) {
-                Serial.printf("Person detected but alert cooldown active (%ds)\n",
-                              (int)ALERT_COOLDOWN_SEC);
-            } else {
-                Serial.println("ALERT: Person detected!");
-                camera_fb_t* fb = capturePhoto(FRAMESIZE_VGA);
-                if (fb) {
-                    sendPhotoTelegram(fb, debugInfo.c_str());
-                    esp_camera_fb_return(fb);
-                    markAlertSent();
-                } else {
-                    sendMessageTelegram("🚨 偵測到有人，但警報拍照失敗\n" + debugInfo);
-                    markAlertSent();  // still cool down to avoid spam on capture fail
-                }
-            }
-        } else {
-            Serial.println("Local AI: No person detected");
-        }
+        deviceRunScheduledAI();
         markAIDone(schedulerState);
     }
 
@@ -148,12 +120,10 @@ void loop() {
     if (!heavyJobRan && shouldRunMonitor(schedulerState)) {
         markMonitorRunning(schedulerState);
         Serial.println("Scheduled monitor capture...");
-        camera_fb_t* fb = capturePhoto(FRAMESIZE_SVGA);
-        if (fb) {
-            sendPhotoTelegram(fb, "定期監控");
-            esp_camera_fb_return(fb);
-        } else {
-            sendMessageTelegram("❌ 定期拍照失敗");
+        String error;
+        if (!deviceSendPhoto(FRAMESIZE_SVGA, "定期監控", error)) {
+            Serial.printf("Scheduled monitor failed: %s\n", error.c_str());
+            sendMessageTelegram("❌ 定期監控失敗：" + error);
         }
         markMonitorDone(schedulerState);
     }

@@ -12,6 +12,7 @@
 
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
+#include <math.h>
 
 #ifndef PERSON_SCORE_MARGIN
 #define PERSON_SCORE_MARGIN 0.20f
@@ -119,28 +120,36 @@ bool personDetectInit() {
                   g_person_detect_model_data_len, kTensorArenaSize);
     Serial.printf("Input type=%d dims=%d bytes=%d\n",
                   (int)input->type, input->dims ? input->dims->size : -1, input->bytes);
-    Serial.printf("Detect thresholds: min_score=%.2f margin=%.2f cooldown=%ds\n",
-                  (double)PERSON_MIN_SCORE, (double)PERSON_SCORE_MARGIN,
-                  (int)ALERT_COOLDOWN_SEC);
     return true;
 }
 
-bool detectPersonLocal(String& debugInfo) {
-    debugInfo = "";
+PersonDetectionResult runPersonDetection(float minimum, float margin) {
+    PersonDetectionResult result;
+    String& debugInfo = result.error;
+    const unsigned long started = millis();
+    const auto failed = [&]() {
+        result.durationMs = millis() - started;
+        return result;
+    };
+    if (!isfinite(minimum) || !isfinite(margin) || minimum < 0 || minimum > 1 ||
+        margin < 0 || margin > 1) {
+        debugInfo = "偵測門檻無效";
+        return failed();
+    }
     if (!g_modelReady) {
         debugInfo = "模型未初始化";
         Serial.println(debugInfo);
-        return false;
+        return failed();
     }
     if (input == nullptr || interpreter == nullptr) {
         debugInfo = "interpreter 無效";
-        return false;
+        return failed();
     }
 
     if (!captureGray96(gray_scratch, sizeof(gray_scratch))) {
         debugInfo = "灰階取像失敗";
         Serial.println(debugInfo);
-        return false;
+        return failed();
     }
 
     int grayMean = 0, grayMin = 0, grayMax = 0;
@@ -151,7 +160,7 @@ bool detectPersonLocal(String& debugInfo) {
     if (input->data.raw == nullptr || input->bytes < (size_t)kMaxImageSize) {
         debugInfo = "input tensor buffer 無效";
         Serial.println(debugInfo);
-        return false;
+        return failed();
     }
     if (input->type == kTfLiteInt8) {
         for (int i = 0; i < kMaxImageSize; i++) {
@@ -162,21 +171,22 @@ bool detectPersonLocal(String& debugInfo) {
     } else {
         debugInfo = "不支援的 input type";
         Serial.printf("%s: %d\n", debugInfo.c_str(), (int)input->type);
-        return false;
+        return failed();
     }
 
     int64_t t0 = esp_timer_get_time();
     if (interpreter->Invoke() != kTfLiteOk) {
         debugInfo = "推論 Invoke 失敗";
         Serial.println(debugInfo);
-        return false;
+        return failed();
     }
     int64_t elapsedMs = (esp_timer_get_time() - t0) / 1000;
 
     TfLiteTensor* output = interpreter->output(0);
-    if (output == nullptr) {
+    if (output == nullptr || output->data.raw == nullptr ||
+        output->bytes < ((output->type == kTfLiteFloat32) ? 2 * sizeof(float) : 2)) {
         debugInfo = "output tensor 無效";
-        return false;
+        return failed();
     }
 
     float person_score_f = 0.0f;
@@ -187,31 +197,37 @@ bool detectPersonLocal(String& debugInfo) {
     int out_zp = 0;
 
     if (output->type == kTfLiteInt8 || output->type == kTfLiteUInt8) {
-        // Match official examples: read via uint8 then store as int8.
         person_raw = (int8_t)output->data.uint8[kPersonIndex];
         no_person_raw = (int8_t)output->data.uint8[kNotAPersonIndex];
         out_scale = output->params.scale;
         out_zp = output->params.zero_point;
-        if (out_scale != 0.0f) {
-            person_score_f = (person_raw - out_zp) * out_scale;
-            no_person_score_f = (no_person_raw - out_zp) * out_scale;
-        } else {
-            // Fallback: map signed int8 to approx 0..1
-            person_score_f = ((int)person_raw + 128) / 255.0f;
-            no_person_score_f = ((int)no_person_raw + 128) / 255.0f;
+        if (!isfinite(out_scale) || out_scale <= 0.0f) {
+            debugInfo = "模型輸出比例無效";
+            return failed();
         }
+        const int person = output->type == kTfLiteInt8
+            ? output->data.int8[kPersonIndex] : output->data.uint8[kPersonIndex];
+        const int noPerson = output->type == kTfLiteInt8
+            ? output->data.int8[kNotAPersonIndex] : output->data.uint8[kNotAPersonIndex];
+        person_score_f = (person - out_zp) * out_scale;
+        no_person_score_f = (noPerson - out_zp) * out_scale;
     } else if (output->type == kTfLiteFloat32) {
         person_score_f = output->data.f[kPersonIndex];
         no_person_score_f = output->data.f[kNotAPersonIndex];
     } else {
         debugInfo = "不支援的 output type";
         Serial.printf("%s: %d\n", debugInfo.c_str(), (int)output->type);
-        return false;
+        return failed();
     }
 
-    const bool beatMargin =
-        (person_score_f > (no_person_score_f + PERSON_SCORE_MARGIN));
-    const bool aboveMin = (person_score_f >= PERSON_MIN_SCORE);
+    if (!isfinite(person_score_f) || !isfinite(no_person_score_f) ||
+        person_score_f < 0 || person_score_f > 1 ||
+        no_person_score_f < 0 || no_person_score_f > 1) {
+        debugInfo = "模型輸出分數無效";
+        return failed();
+    }
+    const bool beatMargin = (person_score_f > (no_person_score_f + margin));
+    const bool aboveMin = (person_score_f >= minimum);
     const bool personDetected = beatMargin && aboveMin;
 
     const char* reason = "PERSON";
@@ -230,10 +246,10 @@ bool detectPersonLocal(String& debugInfo) {
              "person=%.3f no_person=%.3f raw=%d/%d zp=%d scale=%.5f "
              "min=%.2f margin=%.2f gray_mean=%d time=%lldms -> %s",
              person_score_f, no_person_score_f, (int)person_raw, (int)no_person_raw,
-             out_zp, (double)out_scale, (double)PERSON_MIN_SCORE,
-             (double)PERSON_SCORE_MARGIN, grayMean, (long long)elapsedMs, reason);
-    debugInfo = buf;
-    Serial.println(debugInfo);
+             out_zp, (double)out_scale, (double)minimum,
+             (double)margin, grayMean, (long long)elapsedMs, reason);
+    result.summary = buf;
+    Serial.println(result.summary);
 
     // Compact caption for Telegram when alerting.
     if (personDetected) {
@@ -241,10 +257,21 @@ bool detectPersonLocal(String& debugInfo) {
         snprintf(cap, sizeof(cap),
                  "🚨 本地偵測到有人\nperson=%.2f no_person=%.2f",
                  person_score_f, no_person_score_f);
-        debugInfo = cap;
+        result.summary = cap;
     }
 
-    return personDetected;
+    result.success = true;
+    result.personDetected = personDetected;
+    result.personScore = person_score_f;
+    result.noPersonScore = no_person_score_f;
+    result.durationMs = millis() - started;
+    return result;
+}
+
+bool detectPersonLocal(String& debugInfo) {
+    const PersonDetectionResult result = runPersonDetection(PERSON_MIN_SCORE, PERSON_SCORE_MARGIN);
+    debugInfo = result.success ? result.summary : result.error;
+    return result.success && result.personDetected;
 }
 
 bool analyzePhotoForHuman(camera_fb_t* /*fb*/, String& aiResponse) {

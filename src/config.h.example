@@ -8,6 +8,14 @@
 #define BOT_TOKEN "123456:ABC-DEF..."
 #define CHAT_ID "your-chat-id"
 
+// LAN MCP: generate a random token (at least 32 characters); empty disables MCP.
+// Never reuse the Telegram token. Send Authorization: Bearer <MCP_AUTH_TOKEN>.
+#define MCP_AUTH_TOKEN ""
+
+// Optional display label (e.g. 客廳); hostname stays unique and automatic.
+#define DEVICE_NAME ""
+
+// First-boot defaults; Telegram/MCP changes are saved in NVS and override these.
 // Local person detection (TFLite Micro person_detection)
 // Both conditions must pass to trigger alert (reduces empty-room false positives).
 #ifndef PERSON_SCORE_MARGIN
@@ -18,12 +26,12 @@
 #endif
 
 // After a person alert photo is sent, suppress further alerts for this many seconds.
-// 0 = disabled. Tuned in firmware (config.h), not via Telegram command.
+// 0 = disabled. Also adjustable through Telegram and MCP.
 #ifndef ALERT_COOLDOWN_SEC
 #define ALERT_COOLDOWN_SEC 0
 #endif
 
-// Default intervals (seconds)
+// First-boot default intervals (seconds); saved settings survive reboot.
 #define DEFAULT_MONITOR_INTERVAL_SEC 10
 #define DEFAULT_AI_INTERVAL_SEC 10
 

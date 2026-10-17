@@ -11,4 +11,5 @@ struct SchedulerState;
 void telegramInit(WiFiClientSecure& client);
 bool sendPhotoTelegram(camera_fb_t* fb, const char* caption = nullptr);
 void sendMessageTelegram(const String& message);
-void handleTelegramMessages(SchedulerState& state);
+// Handles at most one queued message; caller skips other heavy work that loop.
+bool handleTelegramMessages(SchedulerState& state);

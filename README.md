@@ -1,152 +1,191 @@
-# ESP32-CAM 遠端監控系統
+# ESP32-CAM 遠端監控
 
-基於 ESP32-CAM 的遠端監控系統，透過 Telegram Bot 控制拍照、定期監控與**本地 TinyML 人物偵測**。偵測到畫面中有人時，自動回傳警報照片。
+透過 **Telegram Bot** 或同區網 **MCP Agent** 拍照、調畫質、定期監控與偵測人物。曝光、增益、白平衡會隨光線自動調整；人物偵測在板端執行，不需要雲端 AI API。
 
-## 功能特色
-
-- **手動拍照** — Telegram 指令即時拍照回傳
-- **定期監控** — 定時 JPEG 上傳（預設 10 秒，可調 3～86400）
-- **本地人物偵測** — 板端官方 TFLite Micro `person_detection`，無需雲端 API
-- **低光源優化** — OV2640 曝光／增益調整
-- **穩定排程** — 重型任務互斥、完成後再計時、相機 format lazy 切換
-
-## 硬體需求
-
-| 元件 | 說明 |
-|------|------|
-| ESP32-CAM | OV2640 + **PSRAM**（強烈建議） |
-| 燒錄底板 | USB 供電與下載 |
-
-> 本地模型 tensor arena ~100 KB 優先放 PSRAM。無 PSRAM 時 AI 初始化可能失敗。
-
-## 軟體需求
-
-- [PlatformIO](https://platformio.org/)
-- WiFi、[Telegram Bot Token](https://core.telegram.org/bots#how-do-i-create-a-bot)（@BotFather）
-- **不需要** OpenRouter 或其他雲端 API Key
+兩個入口共用操作與設定，修改後自動保存，重開機仍保留。
 
 ## 快速開始
 
-### 1. 設定金鑰
+準備 ESP32-CAM（AI-Thinker／OV2640，建議有 PSRAM）、燒錄底板、WiFi，以及 [PlatformIO](https://platformio.org/)。
 
-```bash
-cp src/config.h.example src/config.h
+### 1. 設定連線
+
+首次設定才複製；已有 `src/config.h` 時保留原檔：
+
+```powershell
+Copy-Item src/config.h.example src/config.h
 ```
 
-編輯 `src/config.h`：
+在 `src/config.h` 填入 WiFi 與 [Telegram Bot](https://core.telegram.org/bots#how-do-i-create-a-bot) 資料：
 
 ```cpp
 #define WIFI_SSID "你的WiFi名稱"
 #define WIFI_PASSWORD "你的WiFi密碼"
 #define BOT_TOKEN "你的Bot Token"
 #define CHAT_ID "你的Chat ID"
-
-// 偵測門檻（兩者都要過才警報）
-#define PERSON_SCORE_MARGIN 0.20f
-#define PERSON_MIN_SCORE 0.70f
-
-// 間隔與冷卻
-#define DEFAULT_MONITOR_INTERVAL_SEC 10
-#define DEFAULT_AI_INTERVAL_SEC 10
-#define MIN_MONITOR_INTERVAL_SEC 3
-#define MAX_MONITOR_INTERVAL_SEC 86400
-#define MIN_AI_INTERVAL_SEC 3
-#define MAX_AI_INTERVAL_SEC 86400
-#define ALERT_COOLDOWN_SEC 0   // 0=關閉；改此值需重燒（非 Telegram 指令）
+#define MCP_AUTH_TOKEN ""  // 要啟用 MCP，填入獨立隨機金鑰，至少 32 字元
+#define DEVICE_NAME ""     // 選填顯示名稱，例如「客廳」；主機名稱仍自動產生
 ```
 
-> `config.h` 已在 `.gitignore`。
+MCP 金鑰可用 `python -c "import secrets; print(secrets.token_hex(32))"` 產生，不要沿用 Telegram Token。空白、少於 32 字元或未設定時，只關閉 MCP。
 
-### 2. 取得 Chat ID
+`config.h` 已排除版控。其餘預設值見 [`config.h.example`](src/config.h.example)。
 
-與 `@userinfobot` 對話取得數字 ID，填入 `CHAT_ID`。
+### 2. 編譯與燒錄
 
-### 3. 編譯與燒錄
-
-```bash
+```powershell
+pio run
 pio run -t upload
+pio device monitor --port COM3 --baud 115200
 ```
 
-預設埠 `COM3`（見 `platformio.ini`）。啟動後 Telegram 會收到開機訊息。
+預設埠 `COM3`。啟動成功後，Telegram 會收到開機訊息；Serial 顯示板子 IP。
 
-## Telegram 指令
+建置固定使用 `espressif32@6.12.0`、Arduino 2.x 與 `huge_app.csv`，請保留 [`platformio.ini`](platformio.ini) 設定。燒錄後只需供電和 WiFi，不需要電腦當中繼。
 
-| 指令 | 功能 |
-|------|------|
-| `/start` | 說明 |
-| `/photo` | 立即拍照（SVGA） |
-| `/monitor_on` / `/monitor_off` | 定期監控開關 |
-| `/monitor_interval <秒>` | 監控間隔（3～86400） |
-| `/ai_on` / `/ai_off` | 本地人物偵測開關 |
-| `/ai_interval <秒>` | 偵測間隔（3～86400） |
-| `/status` | 狀態（含警報冷卻設定） |
+## Telegram／MCP 功能對照
 
-## 本地人物偵測
+Telegram 只接受 `CHAT_ID`，照片固定傳到該 chat。MCP 共 **8 個工具**：
 
-### 流程
+| 功能 | Telegram | MCP |
+|------|----------|-----|
+| 拍照回傳 | `/photo [解析度]` | `camera_capture`：回圖給 Agent |
+| 拍照傳 Telegram | `/photo [解析度]` | `camera_send_telegram`：回傳送達結果 |
+| 調畫質並保存 | `/camera <JSON>` | `camera_configure` |
+| 調監控／AI 開關及間隔並保存 | `/monitor <JSON>` | `monitor_configure` |
+| 立即偵測一次、取得分數 | `/detect` | `detection_run` |
+| 查最近偵測結果與時間 | `/detect_status` | `detection_status` |
+| 調人物門檻、警報冷卻並保存 | `/detect_config <JSON>` | `detection_configure` |
+| 完整設定、記憶體及錯誤紀錄 | `/status` | `camera_status` |
+| 操作說明 | `/start` | `tools/list` |
 
-1. 依間隔取 **96×96 灰階**（已在灰階則不 reinit）
-2. uint8→int8（`^ 0x80`）餵入 TFLite `person_detection`
-3. 同時滿足 margin + min_score → 視為有人
-4. 若 `ALERT_COOLDOWN_SEC` 允許 → 再拍 VGA JPEG 警報
-5. 無人則靜默；相機可維持灰階直到下次需要 JPEG
+原有指令保留：`/monitor_on`、`/monitor_off`、`/monitor_interval <秒>`、`/ai_on`、`/ai_off`、`/ai_interval <秒>`。
 
-### 模型
+拍照解析度：`vga`＝640×480、`svga`＝800×600（預設）、`xga`＝1024×768、`uxga`＝1600×1200。MCP 使用 `resolution` 參數；無 PSRAM 時降為 CIF（400×296）。
 
-| 項目 | 內容 |
-|------|------|
-| 模型 | TFLite Micro person_detection（int8，~300 KB） |
-| 輸入 | 96×96 灰階 |
-| 輸出 | no_person / person |
-| 成本 | 離線、零 API 費 |
+### 設定參數
 
-### 準度
+Telegram 的 JSON 與 MCP 的 `arguments` 使用相同欄位。三個設定工具至少提供一項；沒傳的欄位保持原值。以下為尚未保存設定時的預設值。
 
-TinyML 上限有限。空房誤報可提高 `PERSON_MIN_SCORE`；漏報則略降。警報照與模型輸入**不是同一幀**。
+| 設定 | 欄位 | 範圍／預設 |
+|------|------|------------|
+| 相機 | `brightness`、`contrast`、`saturation` | 整數 -2～2，預設 0 |
+| 相機 | `exposure_level` | 整數 -2～2，預設 +1 |
+| 相機 | `gain_ceiling` | 0＝2x、1＝4x、2＝8x、3＝16x（預設）、4＝32x |
+| 相機 | `jpeg_quality` | 整數 8～20，預設 8；越小越清楚、檔案越大 |
+| 監控 | `monitor_enabled`、`ai_enabled` | `true`／`false`，預設關閉 |
+| 監控 | `monitor_interval_sec`、`ai_interval_sec` | 整數 3～86400 秒，預設各 10 秒 |
+| 偵測 | `person_min_score`、`person_score_margin` | 數值 0～1，預設 0.7／0.2 |
+| 偵測 | `alert_cooldown_sec` | 整數 0～86400 秒，預設 0＝關閉冷卻 |
 
-## 專案結構
+曝光、增益與白平衡持續自動調整。提高增益上限也可能增加雜點，請以實拍比較。
 
+### Telegram 範例
+
+```text
+/photo uxga
+/camera {"exposure_level":1,"gain_ceiling":3,"jpeg_quality":8}
+/monitor {"monitor_enabled":true,"monitor_interval_sec":30,"ai_enabled":false}
+/detect_config {"person_min_score":0.7,"person_score_margin":0.2,"alert_cooldown_sec":30}
+/detect
+/detect_status
+/status
 ```
-ESP-32-CAM_remote_monitor/
-├── platformio.ini
-├── README.md / CONTEXT.md / CLAUDE.md / AGENTS.md
-├── src/
-│   ├── config.h.example / config.h
-│   ├── main.cpp
-│   ├── camera.* / telegram.* / ai_monitor.* / scheduler.*
-│   ├── model_settings.h
-│   └── person_detect_model_data.*
-└── ...
+
+## 接入 MCP
+
+Agent 必須位於板子的同一子網，支援 **Streamable HTTP** 與自訂 `Authorization` header。每台網址為 `http://esp32cam-<設備ID>.local/mcp`，無法解析時改用 `http://<板子IP>/mcp`。
+
+### 如何知道每台的名稱
+
+名稱依完整 MAC 自動產生，重開機或 IP 改變也不變，**不用查看燒錄內容**：
+
+- **Telegram 開機訊息**：直接列出設備名稱、ID、主機名稱與 MCP 網址。
+- **Telegram `/status`**：隨時查詢名稱與目前 IP；所有訊息和照片也標示設備。
+- **MCP `camera_status`**：回傳 `device_id`、`device_name`、`hostname`、`mcp_url`、`mcp_ip_url`。
+- **Serial 115200**：啟動時列出相同連線資訊；mDNS 公告也包含設備 ID 與 `/mcp` 路徑。
+
+可在 `config.h` 選填 `DEVICE_NAME` 為「客廳」等顯示名稱，不影響唯一主機名稱。多台分別加入 Agent，使用不同連線名稱與各自 MCP 金鑰；Telegram 控制需每台使用不同 Bot Token，可共用同一 `CHAT_ID`。
+
+舊版固定的 `esp32cam.local` 已改為各台名稱，既有客戶端需更新 URL。
+
+### Agent 連線範例
+
+支援以下格式的客戶端，可使用 [`mcp.config.example.json`](mcp.config.example.json)。以下網址是範例，改成開機訊息中的實際網址，金鑰則填各台已燒錄的 `MCP_AUTH_TOKEN`；只有一台時保留一筆即可：
+
+```json
+{
+  "mcpServers": {
+    "living_room": {
+      "type": "http",
+      "url": "http://esp32cam-246f28a1b2c3.local/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_LIVING_ROOM_MCP_AUTH_TOKEN"
+      }
+    },
+    "entrance": {
+      "type": "http",
+      "url": "http://esp32cam-246f28d4e5f6.local/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_ENTRANCE_MCP_AUTH_TOKEN"
+      }
+    }
+  }
+}
 ```
 
-| 模組 | 職責 |
-|------|------|
-| main | 初始化、loop、任務互斥、cooldown |
-| camera | JPEG／灰階 lazy 切換 |
-| telegram | Bot 與送圖 |
-| ai_monitor | TFLite 推論 |
-| scheduler | 間隔 due + 完成後計時 |
+各 Agent 的設定格式可能不同；表單欄位填 Streamable HTTP、上述 URL 與 `Authorization: Bearer <金鑰>`。僅支援 stdio 或舊版 SSE 的客戶端無法直接連線；本服務無 OAuth、SSE 或 session。
 
-## 建置注意
+本機若有 `mcp.local.json`，它是含金鑰的私有連線檔，不會自動替 Agent 註冊，**不可公開**。新增 Agent 可沿用現有金鑰；修改板端金鑰才需重燒，並同步更新客戶端。
 
-- **必須** `platform = espressif32@6.12.0`（Arduino 2.x + TensorFlowLite_ESP32）
-- Partition：`huge_app.csv`
-- 上傳埠預設 `COM3`，Serial `115200`
+連線後以 `tools/list` 取得 8 個工具及參數。以下為完整 `tools/call` 請求範例；使用 Agent 工具介面時，提供工具名稱與參數即可：
 
-## 依賴
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "camera_capture",
+    "arguments": {"resolution": "uxga"}
+  }
+}
+```
 
-| 套件 | 用途 |
-|------|------|
-| ArduinoJson v7 | Telegram 依賴 |
-| UniversalTelegramBot | Bot API |
-| TensorFlowLite_ESP32 | 本地推論 |
+**MCP 使用未加密 HTTP，僅限可信任區網，勿轉發上網。** 外網雲端 Agent 無法直接接入。
+
+## 保存、偵測與拍攝行為
+
+- **設定保存**：相機參數、監控／AI 開關及間隔、人物門檻與冷卻自動存入 NVS。已保存的開關若為開啟，重開機會恢復監控；保存失敗會回報並保留原設定。
+- **結果紀錄**：偵測結果與健康紀錄重開機即清空，時間以本次開機後秒數表示。狀態包含最近嘗試、成功及歷史錯誤；偵測失敗會明確回報，不當成「無人」。
+- **人物警報**：本地 TFLite `person_detection` 使用 96×96 灰階，只有 `person >= person_min_score` 且 `person > no_person + person_score_margin` 才發警報。警報照片為 VGA，與模型輸入不是同一幀；送達後才開始冷卻，失敗則等 30 秒重試。
+- **立即偵測**：`/detect`／`detection_run` 只回傳判斷、分數與時間，不改排程、不自動發警報。尚無結果時 `available=false`；失敗時 `success=false`，判斷與分數為 `null`。
+- **操作等待**：兩入口共用完成後 3 秒操作間隔，狀態／結果／說明查詢不受限。拍照可能等待曝光穩定約 2～10 秒，超時則回最新照片；AI、Telegram 與拍照依序執行，MCP 客戶端逾時建議至少 60 秒。
+- **硬體限制**：固定鏡頭無法自動對焦；暗處可能有雜點或拖影，TinyML 也可能誤判。無 PSRAM 時，人物模型可能無法初始化。
+
+WiFi 與金鑰仍由私有 `config.h` 設定，不提供遠端修改、燒錄、重啟、錄影或串流。Telegram 目前略過 TLS 憑證驗證，屬已知限制。
 
 ## 常見問題
 
-**照片太暗** — 調 `camera.cpp` 的 `applyLowLightSettings()`（`ae_level`、`gainceiling`）。
+| 現象 | 檢查方式 |
+|------|----------|
+| 找不到設備的 `.local` 名稱 | 從 Telegram 開機訊息或 `/status` 確認網址，或改用目前 IP |
+| MCP 無法連線 | 確認供電、WiFi、金鑰已燒錄，且網路未隔離用戶端 |
+| HTTP 401 | Bearer token 缺少或與板端不一致 |
+| HTTP 403 | 來源非同子網，或 Host／Origin 不符；直接使用該台 IP 或唯一主機名稱 |
+| HTTP 405 | 已通過認證，但用了非 POST 方法；`/mcp` 不是網頁 |
+| `Busy`／逾時 | 等上次操作完成 3 秒，或調長客戶端逾時 |
+| 照片太暗／空房誤報 | 調整曝光／增益或偵測門檻，再用照片與分數確認；極暗仍需補光 |
+| 燒錄後沒反應 | 重上電，查看 Serial 115200 與 Telegram 開機訊息 |
 
-**一直報有人但照片沒人** — 調高 `PERSON_MIN_SCORE`／`PERSON_SCORE_MARGIN`；看 Serial `person`／`no_person`／`gray_mean`。
+## 開發與驗證
 
-**燒錄後沒反應** — 重上電；Serial 115200；確認 Telegram 開機訊息。
+```bash
+pio run
+python test/run_host_checks.py
+uv run --no-project --with mcp==2.3.0 test/check_mcp_sdk.py
+```
 
-**platform 編譯失敗** — 勿升到 Arduino 3.x／platform 54.x，鎖定 `espressif32@6.12.0`。
+Host checks 需 `g++`，以真實 C++ 搭配硬體替身驗證 Telegram／MCP 對齊、保存及錯誤處理；官方 SDK 測試驗證 8 工具與完整圖片往返。Windows 可在 WSL 執行 host checks，目前 SDK 測試使用 `Ubuntu-24.04`。
+
+這些測試不代表實機畫質或真人辨識準度已驗證。模組說明、Windows 驗證方式及既有實機證據見 [`CONTEXT.md`](CONTEXT.md)，專案規範見 [`AGENTS.md`](AGENTS.md)。

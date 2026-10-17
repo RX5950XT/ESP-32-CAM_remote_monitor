@@ -24,6 +24,19 @@
 // Default: JPEG mode for Telegram photos.
 bool cameraInit();
 
+struct CameraSettings {
+    int brightness = 0;
+    int contrast = 0;
+    int saturation = 0;
+    int exposureLevel = 1;
+    int gainCeiling = GAINCEILING_16X;
+    int jpegQuality = 8;
+};
+
+CameraSettings cameraSettings();
+// Automatic exposure, gain and white balance remain enabled in every mode.
+bool cameraSetSettings(const CameraSettings& settings);
+
 // Capture JPEG at the requested frame size (camera must be in JPEG mode).
 camera_fb_t* capturePhoto(framesize_t frameSize);
 

@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "living_room": {
+      "type": "http",
+      "url": "http://esp32cam-246f28a1b2c3.local/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_LIVING_ROOM_MCP_AUTH_TOKEN"
+      }
+    },
+    "entrance": {
+      "type": "http",
+      "url": "http://esp32cam-246f28d4e5f6.local/mcp",
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_ENTRANCE_MCP_AUTH_TOKEN"
+      }
+    }
+  }
+}
